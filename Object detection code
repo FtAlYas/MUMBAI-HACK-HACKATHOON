@@ -1,0 +1,621 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+
+// Camera pin definitions for ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// Sensor pins
+const int trigPin = 13;
+const int echoPin = 14;  
+const int buzzerPin = 15;
+
+// Detection settings
+const int MAX_DISTANCE = 100;
+const int DANGER_ZONE = 30;
+const int WARNING_ZONE = 50;
+
+// System variables
+bool personDetected = false;
+unsigned long lastDetectionTime = 0;
+int detectionCount = 0;
+String currentGuidance = "No obstacles";
+String lastAvoidance = "Forward";
+
+// Buzzer control
+unsigned long lastBeepTime = 0;
+int beepState = 0;
+bool buzzerActive = false;
+
+// Preview settings
+const int PREVIEW_WIDTH = 80;
+const int PREVIEW_HEIGHT = 40;
+
+// Camera status
+bool cameraInitialized = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("    SMART OBSTACLE DETECTION SYSTEM");
+  Serial.println("       ESP32-CAM + Large Preview");
+  Serial.println("========================================");
+  
+  // Initialize hardware
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  
+  // Initialize camera
+  cameraInitialized = initializeCamera();
+  if (cameraInitialized) {
+    Serial.println("✅ Camera: READY - Large Preview Enabled");
+  } else {
+    Serial.println("❌ Camera: FAILED - Using sensor only");
+  }
+  
+  Serial.println("✅ Ultrasonic: READY");
+  Serial.println("✅ Buzzer: READY");
+  Serial.println();
+  
+  // Show detection zones
+  Serial.println("=== DETECTION ZONES ===");
+  Serial.println("0-30cm  : DANGER  🔴 Rapid beeps");
+  Serial.println("30-50cm : WARNING 🟡 Double beep"); 
+  Serial.println("50-100cm: ALERT   🟢 Single beep");
+  Serial.println(">100cm  : CLEAR   ✅ No sound");
+  Serial.println("=========================");
+  Serial.println();
+  
+  // Startup sequence
+  startupBeep();
+  delay(1000);
+  
+  Serial.println("🟢 SYSTEM READY - Large Preview Mode Active");
+  Serial.println("    Full frame visualization enabled!");
+  Serial.println();
+  
+  // Show initial large preview
+  showLargePreview(getUltrasonicDistance());
+}
+
+void loop() {
+  int distance = getUltrasonicDistance();
+  
+  // Update main display
+  updateMainDisplay(distance);
+  
+  // Handle person detection and buzzer
+  handleDetection(distance);
+  
+  // Show large preview periodically
+  static unsigned long lastPreviewTime = 0;
+  if (millis() - lastPreviewTime > 4000) { // Every 4 seconds
+    showLargePreview(distance);
+    lastPreviewTime = millis();
+  }
+  
+  delay(300);
+}
+
+bool initializeCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size = FRAMESIZE_QQVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
+  }
+  
+  // Set additional camera parameters if needed
+  sensor_t *s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_brightness(s, 0);     // -2 to 2
+    s->set_contrast(s, 0);       // -2 to 2
+    s->set_saturation(s, 0);     // -2 to 2
+    s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect)
+    s->set_whitebal(s, 1);       // 0 = disable , 1 = enable
+    s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
+    s->set_wb_mode(s, 0);        // 0 to 4 - if awb_gain enabled (0 - Auto)
+    s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
+    s->set_aec2(s, 0);           // 0 = disable , 1 = enable
+    s->set_ae_level(s, 0);       // -2 to 2
+    s->set_aec_value(s, 300);    // 0 to 1200
+    s->set_gain_ctrl(s, 1);      // 0 = disable , 1 = enable
+    s->set_agc_gain(s, 0);       // 0 to 30
+    s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+    s->set_bpc(s, 0);            // 0 = disable , 1 = enable
+    s->set_wpc(s, 1);            // 0 = disable , 1 = enable
+    s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
+    s->set_lenc(s, 1);           // 0 = disable , 1 = enable
+    s->set_hmirror(s, 0);        // 0 = disable , 1 = enable
+    s->set_vflip(s, 0);          // 0 = disable , 1 = enable
+    s->set_dcw(s, 1);            // 0 = disable , 1 = enable
+    s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
+  }
+  
+  return true;
+}
+
+int getUltrasonicDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) {
+    return -1; // No echo received
+  }
+  
+  int distance = duration * 0.034 / 2;
+  
+  // Filter out invalid readings
+  if (distance <= 0 || distance > 400) {
+    return -1;
+  }
+  
+  return distance;
+}
+
+void updateMainDisplay(int distance) {
+  Serial.print("\r"); // Clear current line
+  
+  // Distance with formatting
+  if (distance == -1) {
+    Serial.print("---");
+  } else {
+    if (distance < 100) Serial.print(" ");
+    if (distance < 10) Serial.print(" ");
+    Serial.print(distance);
+  }
+  Serial.print("cm | ");
+  
+  // Status indicator
+  if (distance == -1) {
+    Serial.print("SENSOR ERROR");
+  } else if (distance <= DANGER_ZONE && distance > 0) {
+    Serial.print("🟠 DANGER!  ");
+  } else if (distance <= WARNING_ZONE) {
+    Serial.print("🟡 WARNING ");
+  } else if (distance <= MAX_DISTANCE) {
+    Serial.print("🟢 ALERT   ");
+  } else {
+    Serial.print("✅ CLEAR   ");
+  }
+  
+  Serial.print(" | Guide: ");
+  Serial.print(currentGuidance);
+  
+  // Clear remaining space
+  Serial.print("                ");
+}
+
+void handleDetection(int distance) {
+  unsigned long currentTime = millis();
+  
+  if (distance > 0 && distance <= MAX_DISTANCE) {
+    // Object detected - handle buzzer patterns
+    if (!personDetected) {
+      personDetected = true;
+      detectionCount++;
+      Serial.println();
+      Serial.println("🚨 OBJECT DETECTED! Detection #" + String(detectionCount));
+      generateGuidance(distance);
+    }
+    
+    // Buzzer patterns based on distance
+    if (distance <= DANGER_ZONE) {
+      // Rapid beeping for danger
+      if (currentTime - lastBeepTime >= 150) {
+        digitalWrite(buzzerPin, !digitalRead(buzzerPin));
+        lastBeepTime = currentTime;
+      }
+    } 
+    else if (distance <= WARNING_ZONE) {
+      // Double beep pattern
+      handleDoubleBeep(currentTime);
+    }
+    else {
+      // Single beep pattern
+      if (currentTime - lastBeepTime >= 1000) {
+        digitalWrite(buzzerPin, HIGH);
+        delay(50);
+        digitalWrite(buzzerPin, LOW);
+        lastBeepTime = currentTime;
+      }
+    }
+    
+  } else {
+    // No object detected
+    digitalWrite(buzzerPin, LOW);
+    beepState = 0;
+    
+    if (personDetected) {
+      personDetected = false;
+      currentGuidance = "Path clear";
+      Serial.println();
+      Serial.println("✅ Area clear - Safe to move forward");
+    }
+  }
+}
+
+void handleDoubleBeep(unsigned long currentTime) {
+  switch (beepState) {
+    case 0: // First beep start
+      digitalWrite(buzzerPin, HIGH);
+      beepState = 1;
+      lastBeepTime = currentTime;
+      break;
+    case 1: // First beep end
+      if (currentTime - lastBeepTime >= 100) {
+        digitalWrite(buzzerPin, LOW);
+        beepState = 2;
+        lastBeepTime = currentTime;
+      }
+      break;
+    case 2: // Second beep start
+      if (currentTime - lastBeepTime >= 100) {
+        digitalWrite(buzzerPin, HIGH);
+        beepState = 3;
+        lastBeepTime = currentTime;
+      }
+      break;
+    case 3: // Second beep end and reset
+      if (currentTime - lastBeepTime >= 100) {
+        digitalWrite(buzzerPin, LOW);
+        beepState = 0;
+        lastBeepTime = currentTime;
+      }
+      break;
+  }
+}
+
+void generateGuidance(int distance) {
+  if (!cameraInitialized) {
+    // Camera not available, use distance-based guidance only
+    if (distance <= 20) {
+      currentGuidance = "STOP - Obstacle too close!";
+    } else if (distance <= 50) {
+      currentGuidance = "Move carefully - Obstacle nearby";
+    } else {
+      currentGuidance = "Continue with caution";
+    }
+    Serial.println("💡 GUIDANCE: " + currentGuidance);
+    provideStepByStepInstructions(currentGuidance);
+    return;
+  }
+  
+  camera_fb_t *fb = esp_camera_fb_get();
+  
+  if (fb) {
+    String guidance = analyzeObstaclePosition(fb, distance);
+    currentGuidance = guidance;
+    
+    Serial.println("💡 GUIDANCE: " + guidance);
+    provideStepByStepInstructions(guidance);
+    
+    esp_camera_fb_return(fb);
+  } else {
+    currentGuidance = "Move carefully forward";
+    Serial.println("💡 GUIDANCE: Move carefully forward (camera error)");
+  }
+}
+
+String analyzeObstaclePosition(camera_fb_t *fb, int distance) {
+  int width = fb->width;
+  int height = fb->height;
+  uint8_t* buffer = fb->buf;
+  
+  // Analyze left, center, right sections
+  int leftSum = 0, centerSum = 0, rightSum = 0;
+  int leftCount = 0, centerCount = 0, rightCount = 0;
+  
+  int leftBound = width / 3;
+  int rightBound = 2 * width / 3;
+  
+  // Sample entire frame for better analysis
+  for (int y = 0; y < height; y += 2) {
+    for (int x = 0; x < width; x += 2) {
+      int pixel = buffer[y * width + x];
+      
+      if (x < leftBound) {
+        leftSum += pixel;
+        leftCount++;
+      } else if (x < rightBound) {
+        centerSum += pixel;
+        centerCount++;
+      } else {
+        rightSum += pixel;
+        rightCount++;
+      }
+    }
+  }
+  
+  // Calculate averages
+  float leftAvg = leftCount > 0 ? (float)leftSum / leftCount : 0;
+  float centerAvg = centerCount > 0 ? (float)centerSum / centerCount : 0;
+  float rightAvg = rightCount > 0 ? (float)rightSum / rightCount : 0;
+  
+  // Decision logic
+  if (distance <= 20) {
+    // Very close - urgent avoidance
+    if (leftAvg > centerAvg + 20 && leftAvg > rightAvg + 10) {
+      lastAvoidance = "LEFT";
+      return "Turn LEFT quickly - Close obstacle!";
+    } else if (rightAvg > centerAvg + 20 && rightAvg > leftAvg + 10) {
+      lastAvoidance = "RIGHT"; 
+      return "Turn RIGHT quickly - Close obstacle!";
+    } else {
+      return "Step BACK - Obstacle too close!";
+    }
+  } else if (distance <= 50) {
+    // Medium distance - normal guidance
+    if (leftAvg > rightAvg + 15) {
+      lastAvoidance = "LEFT";
+      return "Move LEFT - Clear path";
+    } else if (rightAvg > leftAvg + 15) {
+      lastAvoidance = "RIGHT";
+      return "Move RIGHT - Clear path";
+    } else if (centerAvg < 50) {
+      return "Slow DOWN - Low visibility";
+    } else {
+      return "Continue FORWARD - Path clear";
+    }
+  } else {
+    // Far distance - gentle guidance
+    if (leftAvg > rightAvg + 10) {
+      return "Bear LEFT - Better path";
+    } else if (rightAvg > leftAvg + 10) {
+      return "Bear RIGHT - Better path";
+    } else {
+      return "Continue straight - All clear";
+    }
+  }
+}
+
+void provideStepByStepInstructions(String guidance) {
+  Serial.println("   👣 Instructions:");
+  
+  if (guidance.indexOf("LEFT") >= 0) {
+    if (guidance.indexOf("quickly") >= 0) {
+      Serial.println("   • STOP immediately");
+      Serial.println("   • Turn 90° to LEFT");
+      Serial.println("   • Take 2 steps forward");
+      Serial.println("   • Resume normal path");
+    } else if (guidance.indexOf("Bear") >= 0) {
+      Serial.println("   • Adjust direction slightly left");
+      Serial.println("   • Continue walking normally");
+    } else {
+      Serial.println("   • Shift weight to right foot");
+      Serial.println("   • Step left with left foot");
+      Serial.println("   • Continue in new direction");
+    }
+  }
+  else if (guidance.indexOf("RIGHT") >= 0) {
+    if (guidance.indexOf("quickly") >= 0) {
+      Serial.println("   • STOP immediately");
+      Serial.println("   • Turn 90° to RIGHT");
+      Serial.println("   • Take 2 steps forward");
+      Serial.println("   • Resume normal path");
+    } else if (guidance.indexOf("Bear") >= 0) {
+      Serial.println("   • Adjust direction slightly right");
+      Serial.println("   • Continue walking normally");
+    } else {
+      Serial.println("   • Shift weight to left foot");
+      Serial.println("   • Step right with right foot");
+      Serial.println("   • Continue in new direction");
+    }
+  }
+  else if (guidance.indexOf("BACK") >= 0) {
+    Serial.println("   • STOP immediately");
+    Serial.println("   • Take 2 steps backward");
+    Serial.println("   • Wait for new guidance");
+  }
+  else if (guidance.indexOf("Slow") >= 0) {
+    Serial.println("   • Reduce walking speed");
+    Serial.println("   • Extend arms for protection");
+    Serial.println("   • Feel ground with each step");
+  }
+  else {
+    Serial.println("   • Continue current path");
+    Serial.println("   • Maintain normal pace");
+    Serial.println("   • Stay alert for changes");
+  }
+  
+  Serial.println("   🛡 Safety: Always verify with physical contact");
+}
+
+void showLargePreview(int distance) {
+  Serial.println();
+  Serial.println("🔍 FULL FRAME PREVIEW " + String(PREVIEW_WIDTH) + "x" + String(PREVIEW_HEIGHT) + " ================");
+  
+  // Show current status
+  Serial.print("📊 Distance: ");
+  if (distance == -1) {
+    Serial.println("Sensor error");
+  } else {
+    Serial.println(String(distance) + "cm");
+  }
+  
+  Serial.println("💡 Guidance: " + currentGuidance);
+  Serial.println("🎯 Detections: " + String(detectionCount));
+  
+  // Camera preview
+  if (cameraInitialized) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      Serial.println("📸 COMPLETE FRAME VIEW:");
+      createFullFramePreview(fb);
+      esp_camera_fb_return(fb);
+    } else {
+      showLargeTextPreview();
+    }
+  } else {
+    showLargeTextPreview();
+  }
+  
+  Serial.println("=====================================================");
+  Serial.println();
+}
+
+void createFullFramePreview(camera_fb_t *fb) {
+  const char* asciiChars = " .,:;+*#%@@"; // More detailed character set
+  int width = fb->width;
+  int height = fb->height;
+  uint8_t* buffer = fb->buf;
+  
+  // Calculate scaling factors
+  float scaleX = (float)width / PREVIEW_WIDTH;
+  float scaleY = (float)height / PREVIEW_HEIGHT;
+  
+  // Create border
+  Serial.print("┌");
+  for (int i = 0; i < PREVIEW_WIDTH; i++) Serial.print("─");
+  Serial.println("┐");
+  
+  // Create large ASCII preview
+  for (int y = 0; y < PREVIEW_HEIGHT; y++) {
+    Serial.print("│");
+    for (int x = 0; x < PREVIEW_WIDTH; x++) {
+      // Calculate average brightness in this block
+      int sum = 0;
+      int count = 0;
+      
+      int startX = (int)(x * scaleX);
+      int startY = (int)(y * scaleY);
+      int endX = (int)((x + 1) * scaleX);
+      int endY = (int)((y + 1) * scaleY);
+      
+      for (int py = startY; py < endY && py < height; py++) {
+        for (int px = startX; px < endX && px < width; px++) {
+          sum += buffer[py * width + px];
+          count++;
+        }
+      }
+      
+      if (count > 0) {
+        int avg = sum / count;
+        int charIndex = map(avg, 0, 255, 0, 10);
+        Serial.print(asciiChars[charIndex]);
+      } else {
+        Serial.print(" ");
+      }
+    }
+    Serial.print("│");
+    
+    // Add path indicators on specific rows
+    if (y == PREVIEW_HEIGHT - 3) {
+      Serial.print(" 🡸LEFT     CENTER     RIGHT🡺");
+    } else if (y == PREVIEW_HEIGHT - 2) {
+      if (personDetected) {
+        Serial.print(" 🚨 OBJECT DETECTED IN VIEW");
+      } else {
+        Serial.print(" ✅ NO OBSTACLES DETECTED");
+      }
+    } else if (y == PREVIEW_HEIGHT - 1) {
+      Serial.print(" 📍 Guidance: " + currentGuidance);
+    }
+    
+    Serial.println();
+  }
+  
+  // Bottom border
+  Serial.print("└");
+  for (int i = 0; i < PREVIEW_WIDTH; i++) Serial.print("─");
+  Serial.println("┘");
+}
+
+void showLargeTextPreview() {
+  int boxWidth = PREVIEW_WIDTH;
+  
+  Serial.print("┌");
+  for (int i = 0; i < boxWidth; i++) Serial.print("─");
+  Serial.println("┐");
+  
+  Serial.print("│");
+  for (int i = 0; i < (boxWidth-20)/2; i++) Serial.print(" ");
+  Serial.print("CAMERA NOT AVAILABLE");
+  for (int i = 0; i < (boxWidth-20)/2; i++) Serial.print(" ");
+  Serial.println("│");
+  
+  for (int y = 2; y < PREVIEW_HEIGHT-3; y++) {
+    Serial.print("│");
+    for (int x = 0; x < boxWidth; x++) {
+      if (y == PREVIEW_HEIGHT/2 && x == boxWidth/2 - 10) {
+        Serial.print("Check connections");
+        x += 17;
+      } else {
+        Serial.print(" ");
+      }
+    }
+    Serial.println("│");
+  }
+  Serial.print("│");
+  for (int i = 0; i < (boxWidth-28)/2; i++) Serial.print(" ");
+  Serial.print("Using ultrasonic sensor only");
+  for (int i = 0; i < (boxWidth-28)/2; i++) Serial.print(" ");
+  Serial.println("│");
+  
+  Serial.print("└");
+  for (int i = 0; i < boxWidth; i++) Serial.print("─");
+  Serial.println("┘");
+}
+void startupBeep() {
+  // System ready sequence
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(buzzerPin, HIGH);
+    delay(100);
+    digitalWrite(buzzerPin, LOW);
+    delay(100);
+  }
+  delay(200);
+  digitalWrite(buzzerPin, HIGH);
+  delay(300);
+  digitalWrite(buzzerPin, LOW);
+}
+
+// Helper function for mapping values
+long map(long x, long in_min, long in_max, long out_min, long out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
